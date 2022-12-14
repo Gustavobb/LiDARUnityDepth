@@ -1,0 +1,205 @@
+#pragma kernel MeanVectorEstimation
+#pragma kernel LeastSquaresFitting
+#pragma kernel NaiveEstimation
+#pragma kernel FitHeightPlane
+
+RWStructuredBuffer<float3> vertices;
+RWStructuredBuffer<float3> normals;
+uint verticesLength;
+
+bool IsInsideSphere(float3 p, float3 c, float r)
+{
+    if (p.x == c.x && p.y == c.y && p.z == c.z)
+            return false;
+
+    return pow(p.x - c.x, 2) + pow(p.y - c.y, 2) + pow(p.z - c.z, 2) <= pow(r, 2);
+}
+
+float3x3 inverse3x3(float3x3 m) 
+{
+    // det(m) = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+    // m = [a, b, c]
+    //     [d, e, f]
+    //     [g, h, i]
+
+    float det = m[0].x * (m[1].y * m[2].z - m[2].y * m[1].z) - m[1].x * (m[0].y * m[2].z - m[2].y * m[0].z) + m[2].x * (m[0].y * m[1].z - m[1].y * m[0].z);
+    float3x3 adj = { 
+        {
+            (m[1].y * m[2].z - m[2].y * m[1].z),
+            -(m[0].y * m[2].z - m[2].y * m[0].z),
+            (m[0].y * m[1].z - m[1].y * m[0].z)
+        },
+        {
+            -(m[1].x * m[2].z - m[2].x * m[1].z),
+            (m[0].x * m[2].z - m[2].x * m[0].z),
+            -(m[0].x * m[1].z - m[1].x * m[0].z)
+        },
+        {
+            (m[1].x * m[2].y - m[2].x * m[1].y),
+            -(m[0].x * m[2].y - m[2].x * m[0].y),
+            (m[0].x * m[1].y - m[1].x * m[0].y)
+        }
+    };
+
+    return (1.0 / det) * adj;
+}
+
+[numthreads(64, 1, 1)]
+void NaiveEstimation (uint3 id : SV_DispatchThreadID)
+{
+    float radius = 0.2f;
+    uint maxNeighbors = 20;
+    float3 neighbors[20];
+    float3 vertex = vertices[id.x];
+
+    uint numNeighbors = 0;
+    for (uint i = 0; i < verticesLength; i++)
+    {
+        if (IsInsideSphere(vertices[i], vertex, radius))
+        {
+            neighbors[numNeighbors] = vertices[i];
+            numNeighbors ++;
+        }
+
+        if (numNeighbors >= maxNeighbors)
+            break;
+    }
+
+    float3 normal = float3(0, 0, 0);
+    for (uint j = 0; j < numNeighbors; j++)
+        normal += cross(neighbors[j] - vertex, neighbors[(j + 1) % numNeighbors] - vertex);
+
+    normal = normalize(normal);
+    float sign = dot(normal, normals[id.x]) > 0 ? 1 : -1;
+
+    normals[id.x] = sign * normal;
+}
+
+[numthreads(64, 1, 1)]
+void MeanVectorEstimation (uint3 id : SV_DispatchThreadID)
+{
+    float3 vertex = vertices[id.x];
+    float3 sumOfVector = float3(0, 0, 0);
+
+    for (uint i = 0; i < verticesLength; i++)
+        sumOfVector += (vertices[i] - vertex);
+
+    normals[id.x] = normalize(sumOfVector);
+}
+
+// https://www.geometrictools.com/Documentation/LeastSquaresFitting.pdf
+[numthreads(64, 1, 1)]
+void FitHeightPlane (uint3 id : SV_DispatchThreadID)
+{
+    float radius = 0.2f;
+    uint maxNeighbors = 20;
+    float3 neighbors[20];
+    float3 vertex = vertices[id.x];
+    float3 mean = float3(0, 0, 0);
+
+    // compute mean of points neighbors in a sphere
+    uint numNeighbors = 0;
+    for (uint i = 0; i < verticesLength; i++)
+    {
+        if (IsInsideSphere(vertices[i], vertex, radius))
+        {
+            neighbors[numNeighbors] = vertices[i];
+            mean += vertices[i];
+            numNeighbors ++;
+        }
+
+        if (numNeighbors >= maxNeighbors)
+            break;
+    }
+
+    mean /= numNeighbors;
+
+    // compute the linear system matrix
+    float xxSum = 0, xySum = 0, xzSum = 0, yySum = 0, yzSum = 0;
+
+    for (uint j = 0; j < numNeighbors; j++)
+    {
+        float3 v = neighbors[j] - mean;
+        xxSum += v.x * v.x;
+        xySum += v.x * v.y;
+        xzSum += v.x * v.z;
+        yySum += v.y * v.y;
+        yzSum += v.y * v.z;
+    }
+
+    // solve the linear system
+    float det = xxSum * yySum - xySum * xySum;
+    float barX = mean.x;
+    float barY = mean.y;
+    float barZ = mean.z;
+    float barA0 = (yySum * xzSum - xySum * yzSum) / det;
+    float barA1 = (xxSum * yzSum - xySum * xzSum) / det;
+
+    // x * ( barA0 - barX ) + y * ( barA1 - barY ) + h ( x, y ) + barH = 0
+    // ax + by + cz + d = 0
+    // n = ( a , b , c )
+    
+    float3 normal = float3(
+        barA0 - barX,
+        barA1 - barY,
+        1
+    );
+
+    normal = normalize(normal);
+    float sign = dot(normal, normals[id.x]) > 0 ? 1 : -1;
+    normals[id.x] = sign * normal;
+}
+
+// https://medium.com/swlh/how-to-find-the-least-squares-plane-from-a-cloud-of-point-using-excel-numbers-etc-92b66f852522
+[numthreads(8, 1, 1)]
+void LeastSquaresFitting (uint3 id : SV_DispatchThreadID)
+{
+    float radius = 1;
+    uint maxNeighbors = 100;
+    float3 neighbors[100];
+    float3 vertex = vertices[id.x];
+
+    uint numNeighbors = 0;
+    for (uint i = 0; i < verticesLength; i++)
+    {
+        if (IsInsideSphere(vertices[i], vertex, radius))
+        {
+            neighbors[numNeighbors] = vertices[i];
+            numNeighbors ++;
+        }
+
+        if (numNeighbors >= maxNeighbors)
+            break;
+    }
+
+    // Calc matrix A, B
+    float3x3 A = float3x3(0, 0, 0, 0, 0, 0, 0, 0, 0);
+    float3 B = float3(0, 0, 0);
+
+    for (uint j = 0; j < numNeighbors; j++)
+    {
+        A[0].x += pow(neighbors[j].x, 2);
+        A[0].y += neighbors[j].x * neighbors[j].y;
+        A[0].z += neighbors[j].x;
+        A[1].x += neighbors[j].x * neighbors[j].y;
+        A[1].y += pow(neighbors[j].y, 2);
+        A[1].z += neighbors[j].y;
+        A[2].x += neighbors[j].x;
+        A[2].y += neighbors[j].y;
+        A[2].z += 1;
+
+        B.x += neighbors[j].x * neighbors[j].z;
+        B.y += neighbors[j].y * neighbors[j].z;
+        B.z += neighbors[j].z;
+    }
+
+    // X = (A^T A)^-1 A^T B
+    float3x3 AT = transpose(A);
+    // float3 X = mul(inverse3x3(mul(AT, A)), mul(AT, B));
+    float3 X = mul(inverse3x3(A), B);
+
+    // normal
+    float3 normal = normalize(X);
+    float sign = dot(normal, normals[id.x]) > 0 ? 1 : -1;
+    normals[id.x] = sign * normal;
+}

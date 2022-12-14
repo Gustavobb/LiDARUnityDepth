@@ -1,0 +1,38 @@
+#pragma kernel CleanPointCloudData
+
+RWStructuredBuffer<float3> vertices;
+RWStructuredBuffer<float3> normals;
+RWStructuredBuffer<uint> idxRemove;
+uint verticesLength;
+
+bool IsInsideSphere(float3 p, float3 c, float r)
+{
+    return pow(p.x - c.x, 2) + pow(p.y - c.y, 2) + pow(p.z - c.z, 2) <= pow(r, 2);
+}
+
+[numthreads(8, 1, 1)]
+void CleanPointCloudData (uint3 id : SV_DispatchThreadID)  
+{
+    float radius = 0.2f;
+    float3 vertex = vertices[id.x];
+
+    uint minNeighbors = 3;
+    uint numNeighbors = 0;
+    for (uint i = 0; i < verticesLength; i++)
+    {
+        if (vertex.x == vertices[i].x && vertex.y == vertices[i].y && vertex.z == vertices[i].z)
+        {
+            idxRemove[id.x] = i;
+            return;
+        }
+
+        if (IsInsideSphere(vertices[i], vertex, radius))
+            numNeighbors ++;
+    }
+
+    if (numNeighbors < minNeighbors)
+    {
+        vertices[id.x] = float3(0, 0, 0);
+        normals[id.x] = float3(0, 0, 0);
+    }
+}
